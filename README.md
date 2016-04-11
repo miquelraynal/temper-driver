@@ -1,3 +1,3 @@
 # linux-kernel-modules
 
-- TEMPer2: USB termometer
+- TEMPer2: USB thermometer
