@@ -1,0 +1,4 @@
+# UDEV rule (/etc/udev/rules.d/)
+# Then reload with:
+# $ udevadm control --reload-rules
+ATTRS{idVendor}=="0c45", ATTRS{idProduct}=="7401", PROGRAM="/bin/sh -c 'echo -n $id:1.0 > /sys/bus/usb/drivers/usbhid/unbind; echo -n $id:1.0 > /sys/bus/usb/drivers/temper/bind'"
