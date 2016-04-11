@@ -8,9 +8,17 @@
 #include "linux/kernel.h"
 #include "linux/module.h"
 #include "linux/usb.h"
+#include "linux/slab.h"
 
 #define TEMPER_VID 0x0c45
 #define TEMPER_PID 0x7401
+
+/* Peripheral definition */
+struct usb_temper {
+	struct usb_device *udev;
+	unsigned int inner_temp; /* °C */
+	unsigned int outer_temp; /* °C */
+};
 
 /* Table of devices that may be used by this driver */
 static struct usb_device_id temper_id_table[] = {
@@ -23,12 +31,29 @@ MODULE_DEVICE_TABLE(usb, temper_id_table);
 static int temper_probe(struct usb_interface *interface, 
 			const struct usb_device_id *id)
 {
+	struct usb_device *udev = interface_to_usbdev(interface);
+	struct usb_temper *temper_dev;
+
+	/* Alloc structure and init it */
+	temper_dev = kmalloc(sizeof(struct usb_temper), GFP_KERNEL);
+	memset(temper_dev, 0x00, sizeof(struct usb_temper));
+	temper_dev->udev = usb_get_dev(udev);
+	temper_dev->inner_temp = 0;
+	temper_dev->outer_temp = 0;
+
+	/* Save interface data */
+	usb_set_intfdata(interface, temper_dev);
 	printk("TEMPer module now attached\n");
 	return 0;
 }
 
 static void temper_disconnect(struct usb_interface *interface)
 {
+	struct usb_temper *dev;
+
+	dev = usb_get_intfdata(interface);
+	usb_put_dev(dev->udev);
+	kfree(dev);
 	printk("TEMPer module now detached\n");
 }
 	
