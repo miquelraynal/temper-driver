@@ -30,3 +30,13 @@
 
 # Debug files
 *.dSYM/
+
+# Emacs temp files
+*~
+
+# Compiled modules (or related)
+*.cmd
+*.symvers
+*.order
+*.mod.c
+.*
