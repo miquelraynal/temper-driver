@@ -9,6 +9,7 @@
 #include "linux/module.h"
 #include "linux/usb.h"
 #include "linux/slab.h"
+#include "linux/stat.h"
 
 #define TEMPER_VID 0x0c45
 #define TEMPER_PID 0x7401
@@ -27,6 +28,20 @@ static struct usb_device_id temper_id_table[] = {
 };
 MODULE_DEVICE_TABLE(usb, temper_id_table);
 
+/* State file */
+static ssize_t show_temperature(struct device *dev, struct device_attribute *attr, 
+			   char *buf)
+{
+	struct usb_interface *intf = to_usb_interface(dev);
+	struct usb_temper *temper_dev = usb_get_intfdata(intf);
+
+	printk("TBD: get value from device\n");
+	return sprintf(buf, "\
+Inner temperature: %d°C\n\
+Outer temperature: %d°C\n", temper_dev->inner_temp, temper_dev->outer_temp);
+}
+static DEVICE_ATTR(temperature, S_IRUGO, show_temperature, NULL);
+
 /* Operations for this driver */
 static int temper_probe(struct usb_interface *interface, 
 			const struct usb_device_id *id)
@@ -43,6 +58,10 @@ static int temper_probe(struct usb_interface *interface,
 
 	/* Save interface data */
 	usb_set_intfdata(interface, temper_dev);
+
+	/* Create state file */
+	device_create_file(&interface->dev, &dev_attr_temperature);
+
 	printk("TEMPer module now attached\n");
 	return 0;
 }
@@ -52,8 +71,16 @@ static void temper_disconnect(struct usb_interface *interface)
 	struct usb_temper *dev;
 
 	dev = usb_get_intfdata(interface);
+
+	/* Remove state file */
+	device_remove_file(&interface->dev, &dev_attr_temperature);
+
+	/* Free interface data */
 	usb_put_dev(dev->udev);
+
+	/* Free device structure */
 	kfree(dev);
+
 	printk("TEMPer module now detached\n");
 }
 	
