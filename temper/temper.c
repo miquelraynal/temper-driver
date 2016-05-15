@@ -1,4 +1,4 @@
-/*  temper.c - Offers sysfs entries to get measured temperature
+/*  temper.c - Offers sysfs entries to get measured temperatures
  *             from USB key "TEMPer2"
  *
  *  Copyright (C) 2016 by Miquel Raynal
@@ -40,8 +40,8 @@ struct usb_temper {
 	struct urb *int_in_urb;
 	struct usb_endpoint_descriptor *int_in_endpoint;
 	/* Data */
-	unsigned int temperature; /* °C */
-	bool ctrl_completed;
+	unsigned int temp_in; /* m°C */
+	unsigned int temp_out; /* m°C */
 	bool int_completed;
 };
 
@@ -54,29 +54,35 @@ MODULE_DEVICE_TABLE(usb, temper_id_table);
 
 static int get_temp_value (struct usb_temper *temper_dev)
 {
-	int rc = 0, i, l;
+	int rc = 0;
+#if (USE_URB == 1)
+	int i;
+#else
+	int l;
+#endif
 
 	memset(temper_dev->int_in_buffer, 0, TEMPER_INT_BUFFER_SIZE);
 
 #if (USE_URB == 1)
-
 	rc = usb_submit_urb(temper_dev->int_in_urb, GFP_ATOMIC);
 	if (rc) {
 		printk(KERN_ERR "temper: submit int in urb failed (%d)", rc);
-		temper_dev->temperature = -1;
+		temper_dev->temp_in = -1;
+		temper_dev->temp_out = -1;
 		return rc;
 	}
 
 	rc = usb_submit_urb(temper_dev->ctrl_out_urb, GFP_ATOMIC);
 	if (rc < 0) {
 		printk(KERN_ERR "temper: submit ctrl failed (%d)\n", rc);
-		temper_dev->temperature = -1;
+		temper_dev->temp_in = -1;
+		temper_dev->temp_out = -1;
 		return rc;
 	}
 
 	/* Dirty polling, just for the example */
-	rc = -1; //-ENOIO;
-	for (i = 0; i < 10; i ++) {
+	rc = -EIO;
+	for (i = 0; i < 10; i++) {
 		if (temper_dev->int_completed) {
 			temper_dev->int_completed = false;
 			rc = 0;
@@ -86,7 +92,6 @@ static int get_temp_value (struct usb_temper *temper_dev)
 	}
 
 #else
-
 	rc = usb_control_msg(temper_dev->udev,
 		usb_sndctrlpipe(temper_dev->udev, 0),
 		TEMPER_CTRL_REQUEST,
@@ -110,63 +115,69 @@ static int get_temp_value (struct usb_temper *temper_dev)
 		2 * HZ);
 	if (rc < 0) {
 	        printk(KERN_ERR "temper: interrupt message failed (%d)", rc);
-	        temper_dev->temperature = -1;
+	        temper_dev->temp_in = -1;
+	        temper_dev->temp_out = -1;
 		return rc;
         }
-
 #endif
 
-//		temper_dev->temp = (buf[3] & 0xff) + (buf[2] << 8);
-	temper_dev->temperature++;
+	temper_dev->temp_in =
+		(temper_dev->int_in_buffer[3] & 0xff) + 
+		((temper_dev->int_in_buffer[2] & 0xff) << 8); /* Raw */
+	temper_dev->temp_in *= 125 / 32; /* m°C */
+
+	temper_dev->temp_out =
+		(temper_dev->int_in_buffer[5] & 0xff) + 
+		((temper_dev->int_in_buffer[4] & 0xff) << 8); /* Raw */
+	temper_dev->temp_out *= 125 / 32; /* m°C */
 
 	return rc;
 }
 
 /* State file */
-static ssize_t show_temperature(struct device *dev, struct device_attribute *attr, 
+static ssize_t show_temperatures(struct device *dev, struct device_attribute *attr, 
 			   char *buf)
 {
 	struct usb_interface *intf = to_usb_interface(dev);
 	struct usb_temper *temper_dev = usb_get_intfdata(intf);
-//	int rc;
+
 	get_temp_value(temper_dev);
 
-	return sprintf(buf, "Temperature: %d°C\n", temper_dev->temperature);
+	return sprintf(buf, "Temperature in:  %3d.%03d°C\nTemperature out: %3d.%03d°C\n",
+		       temper_dev->temp_in / 1000, temper_dev->temp_in % 1000,
+		       temper_dev->temp_out / 1000, temper_dev->temp_out % 1000);
 }
-static DEVICE_ATTR(temperature, S_IRUGO, show_temperature, NULL);
+static DEVICE_ATTR(temperatures, S_IRUGO, show_temperatures, NULL);
 
 /* Operations for this driver */
-
+#if USE_URB == 1
 static void temper_ctrl_out_callback(struct urb *urb)
 {
-	struct usb_temper *temper_dev = urb->context;
-
-	printk("ctrl out callback\n");
-	temper_dev->ctrl_completed = true;
+        printk(KERN_INFO "temper: %s\n", __FUNCTION__); /* NOP */
 }
 
 static void temper_int_in_callback(struct urb *urb)
 {
 	struct usb_temper *temper_dev = urb->context;
-//	int rc = 0;
 
-	printk("int in callback\n");
+        printk(KERN_INFO "temper: %s\n", __FUNCTION__);
+
 	if (urb->status) {
 		if (urb->status == -ENOENT ||
 		    urb->status == -ECONNRESET ||
 		    urb->status == -ESHUTDOWN) {
-			printk("non-zero urb status (%d) error", urb->status);
+			printk(KERN_ERR "temper: non-zero urb status (%d) error",
+				       urb->status);
 			return;
 		} else {
-			printk("non-zero urb status (%d) may be tried again", urb->status);
+			printk(KERN_ERR "temper: non-zero urb status (%d) may be tried again",
+				       urb->status);
 			return;
 		}
 	}
 
 	if (urb->actual_length > 0) {
-		//spin_lock(&dev->cmd_spinlock);
-
-		printk("read %dB: %02x%02x%02x%02x %02x%02x%02x%02x\n",
+		printk(KERN_DEBUG "temper: read %dB: %02x%02x%02x%02x %02x%02x%02x%02x\n",
 		       urb->actual_length,
 		       temper_dev->int_in_buffer[0],
 		       temper_dev->int_in_buffer[1],
@@ -180,6 +191,7 @@ static void temper_int_in_callback(struct urb *urb)
 
 	temper_dev->int_completed = true;
 }
+#endif
 
 static int temper_probe(struct usb_interface *interface, 
 			const struct usb_device_id *id)
@@ -210,12 +222,13 @@ static int temper_probe(struct usb_interface *interface,
 		        temper_dev->int_in_endpoint = endpoint;
 
 		temper_dev->int_in_endpoint = endpoint;
-		printk("EP addr 0x%02x\n", endpoint->bEndpointAddress);
+		printk(KERN_INFO "temper: EP addr 0x%02x\n", endpoint->bEndpointAddress);
 	}
 
 	if (!temper_dev->int_in_endpoint) {
 		printk(KERN_ERR "temper: could not find interrupt in endpoint");
-		goto error;
+		rc = -ENODEV;
+		goto exit_err;
 	}
 
 	/* Alloc in and out buffers */
@@ -223,7 +236,7 @@ static int temper_probe(struct usb_interface *interface,
 	if (!temper_dev->ctrl_out_buffer) {
 		printk(KERN_ERR "temper: could not allocate ctrl_buffer");
 		rc = -ENOMEM;
-		goto error;
+		goto exit_err;
 	}
 	memcpy(temper_dev->ctrl_out_buffer, temper_buf_get_temp, TEMPER_CTRL_BUFFER_SIZE);
 
@@ -233,22 +246,20 @@ static int temper_probe(struct usb_interface *interface,
 	if (!temper_dev->int_in_buffer) {
 		printk(KERN_ERR "temper: could not allocate int_in_buffer");
 		rc = -ENOMEM;
-		goto error;
+		goto free_out_buf;
 	}
 
 #if USE_URB == 1
 	/* Set up the interrupt in URB */
 	temper_dev->int_in_urb = usb_alloc_urb(0, GFP_KERNEL);
 	if (!temper_dev->int_in_urb) {
-		printk("could not allocate int_in_urb");
+		printk(KERN_ERR "temper: could not allocate int_in_urb");
 		rc = -ENOMEM;
-		goto error;
-	}
-	if (temper_dev->int_in_endpoint->bEndpointAddress != 0x82){
-	  printk("error dans le choix de l'endpoint !, à changer %0x\n", temper_dev->int_in_endpoint->bEndpointAddress);
-	    temper_dev->int_in_endpoint->bEndpointAddress = 0x82;
+		goto free_int_buf;
 	}
 
+        /* The question is, why endpoint 0x81 is not working with URBs ? */
+        temper_dev->int_in_endpoint->bEndpointAddress = 0x82;
 	usb_fill_int_urb(temper_dev->int_in_urb,
 			 temper_dev->udev,
 			 usb_rcvintpipe(
@@ -264,9 +275,9 @@ static int temper_probe(struct usb_interface *interface,
 	/* Set up the control out URB */
 	temper_dev->ctrl_out_cr = kmalloc(sizeof(struct usb_ctrlrequest), GFP_KERNEL);
 	if (!temper_dev->ctrl_out_cr) {
-		printk("could not allocate usb_ctrlrequest");
+		printk(KERN_ERR "temper: could not allocate usb_ctrlrequest");
 		rc = -ENOMEM;
-		goto error;
+		goto free_int_urb;
 	}
 
 	temper_dev->ctrl_out_cr->bRequestType = TEMPER_CTRL_REQUEST_TYPE;
@@ -277,9 +288,9 @@ static int temper_probe(struct usb_interface *interface,
 
 	temper_dev->ctrl_out_urb = usb_alloc_urb(0, GFP_KERNEL);
 	if (!temper_dev->ctrl_out_urb) {
-		printk("could not allocate ctrl_out_urb");
+		printk(KERN_ERR "temper: could not allocate ctrl_out_urb");
 		rc = -ENOMEM;
-		goto error;
+		goto free_out_cr;
 	}
 
 	usb_fill_control_urb(temper_dev->ctrl_out_urb,
@@ -290,12 +301,11 @@ static int temper_probe(struct usb_interface *interface,
 			     TEMPER_CTRL_BUFFER_SIZE,
 			     temper_ctrl_out_callback,
 			     temper_dev);	
-
 #endif
 
 	/* Data */
-	temper_dev->temperature = 0;
-	temper_dev->ctrl_completed = false;
+	temper_dev->temp_in = 0;
+	temper_dev->temp_out = 0;
 	temper_dev->int_completed = false;
 	get_temp_value(temper_dev);
 
@@ -303,13 +313,25 @@ static int temper_probe(struct usb_interface *interface,
 	usb_set_intfdata(interface, temper_dev);
 
 	/* Create state file */
-	device_create_file(&interface->dev, &dev_attr_temperature);
+	device_create_file(&interface->dev, &dev_attr_temperatures);
 
-	printk("TEMPer module now attached and configured\n");
+	printk(KERN_INFO "TEMPer module now attached and configured\n");
 
 	return 0;
 
-error:
+#if USE_URB == 1
+free_out_cr:
+	kfree(temper_dev->ctrl_out_cr);
+free_int_urb:
+	kfree(temper_dev->int_in_urb);
+free_int_buf:
+	kfree(temper_dev->int_in_buffer);
+#endif
+free_out_buf:
+	kfree(temper_dev->ctrl_out_buffer);
+exit_err:
+	usb_put_dev(temper_dev->udev);
+	kfree(temper_dev);
 	return rc;
 }
 
@@ -320,19 +342,21 @@ static void temper_disconnect(struct usb_interface *interface)
 	temper_dev = usb_get_intfdata(interface);
 
 	/* Remove state file */
-	device_remove_file(&interface->dev, &dev_attr_temperature);
+	device_remove_file(&interface->dev, &dev_attr_temperatures);
 
 	/* Free interface data */
-	kfree(temper_dev->int_in_buffer);
-	kfree(temper_dev->int_in_urb);
-//	kfree(temper_dev->ctrl_out_buffer);
+#if USE_URB == 1
 	kfree(temper_dev->ctrl_out_cr);
+	kfree(temper_dev->int_in_urb);
+	kfree(temper_dev->int_in_buffer);
+#endif
+	kfree(temper_dev->ctrl_out_buffer);
 	usb_put_dev(temper_dev->udev);
 
 	/* Free device structure */
 	kfree(temper_dev);
 
-	printk("TEMPer module now detached\n");
+	printk(KERN_INFO "TEMPer module now detached\n");
 }
 	
 /* Main structure */
