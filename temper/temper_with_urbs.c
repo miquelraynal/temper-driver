@@ -11,6 +11,8 @@
 #include "linux/slab.h"
 #include "linux/stat.h"
 
+#define USE_URB 1
+
 #define TEMPER_VID 0x0c45
 #define TEMPER_PID 0x7401
 
@@ -31,13 +33,16 @@ struct usb_temper {
 	struct usb_interface *interface;
 	/* Ctrl out EP */
 	char *ctrl_out_buffer;
+	struct urb *ctrl_out_urb;
 	struct usb_ctrlrequest *ctrl_out_cr;
 	/* Interrupt in EP */
 	char *int_in_buffer;
+	struct urb *int_in_urb;
 	struct usb_endpoint_descriptor *int_in_endpoint;
 	/* Data */
 	unsigned int temp_in; /* m°C */
 	unsigned int temp_out; /* m°C */
+	bool int_completed;
 };
 
 /* Table of devices that may be used by this driver */
@@ -50,10 +55,43 @@ MODULE_DEVICE_TABLE(usb, temper_id_table);
 static int get_temp_value (struct usb_temper *temper_dev)
 {
 	int rc = 0;
+#if (USE_URB == 1)
+	int i;
+#else
 	int l;
+#endif
 
 	memset(temper_dev->int_in_buffer, 0, TEMPER_INT_BUFFER_SIZE);
 
+#if (USE_URB == 1)
+	rc = usb_submit_urb(temper_dev->int_in_urb, GFP_ATOMIC);
+	if (rc) {
+		printk(KERN_ERR "temper: submit int in urb failed (%d)", rc);
+		temper_dev->temp_in = -1;
+		temper_dev->temp_out = -1;
+		return rc;
+	}
+
+	rc = usb_submit_urb(temper_dev->ctrl_out_urb, GFP_ATOMIC);
+	if (rc < 0) {
+		printk(KERN_ERR "temper: submit ctrl failed (%d)\n", rc);
+		temper_dev->temp_in = -1;
+		temper_dev->temp_out = -1;
+		return rc;
+	}
+
+	/* Dirty polling, just for the example */
+	rc = -EIO;
+	for (i = 0; i < 10; i++) {
+		if (temper_dev->int_completed) {
+			temper_dev->int_completed = false;
+			rc = 0;
+			break;
+		}
+		msleep(20);
+	}
+
+#else
 	rc = usb_control_msg(temper_dev->udev,
 		usb_sndctrlpipe(temper_dev->udev, 0),
 		TEMPER_CTRL_REQUEST,
@@ -81,6 +119,7 @@ static int get_temp_value (struct usb_temper *temper_dev)
 	        temper_dev->temp_out = -1;
 		return rc;
         }
+#endif
 
 	temper_dev->temp_in =
 		(temper_dev->int_in_buffer[3] & 0xff) + 
@@ -109,6 +148,50 @@ static ssize_t show_temperatures(struct device *dev, struct device_attribute *at
 		       temper_dev->temp_out / 1000, temper_dev->temp_out % 1000);
 }
 static DEVICE_ATTR(temperatures, S_IRUGO, show_temperatures, NULL);
+
+/* Operations for this driver */
+#if USE_URB == 1
+static void temper_ctrl_out_callback(struct urb *urb)
+{
+        printk(KERN_INFO "temper: %s\n", __FUNCTION__); /* NOP */
+}
+
+static void temper_int_in_callback(struct urb *urb)
+{
+	struct usb_temper *temper_dev = urb->context;
+
+        printk(KERN_INFO "temper: %s\n", __FUNCTION__);
+
+	if (urb->status) {
+		if (urb->status == -ENOENT ||
+		    urb->status == -ECONNRESET ||
+		    urb->status == -ESHUTDOWN) {
+			printk(KERN_ERR "temper: non-zero urb status (%d) error",
+				       urb->status);
+			return;
+		} else {
+			printk(KERN_ERR "temper: non-zero urb status (%d) may be tried again",
+				       urb->status);
+			return;
+		}
+	}
+
+	if (urb->actual_length > 0) {
+		printk(KERN_DEBUG "temper: read %dB: %02x%02x%02x%02x %02x%02x%02x%02x\n",
+		       urb->actual_length,
+		       temper_dev->int_in_buffer[0],
+		       temper_dev->int_in_buffer[1],
+		       temper_dev->int_in_buffer[2],
+		       temper_dev->int_in_buffer[3],
+		       temper_dev->int_in_buffer[4],
+		       temper_dev->int_in_buffer[5],
+		       temper_dev->int_in_buffer[6],
+		       temper_dev->int_in_buffer[7]);
+	}
+
+	temper_dev->int_completed = true;
+}
+#endif
 
 static int temper_probe(struct usb_interface *interface, 
 			const struct usb_device_id *id)
@@ -166,9 +249,64 @@ static int temper_probe(struct usb_interface *interface,
 		goto free_out_buf;
 	}
 
+#if USE_URB == 1
+	/* Set up the interrupt in URB */
+	temper_dev->int_in_urb = usb_alloc_urb(0, GFP_KERNEL);
+	if (!temper_dev->int_in_urb) {
+		printk(KERN_ERR "temper: could not allocate int_in_urb");
+		rc = -ENOMEM;
+		goto free_int_buf;
+	}
+
+        /* The question is, why endpoint 0x81 is not working with URBs ? */
+        temper_dev->int_in_endpoint->bEndpointAddress = 0x82;
+	usb_fill_int_urb(temper_dev->int_in_urb,
+			 temper_dev->udev,
+			 usb_rcvintpipe(
+				 temper_dev->udev,
+				 temper_dev->int_in_endpoint->bEndpointAddress),
+			 temper_dev->int_in_buffer,
+			 le16_to_cpu(
+			    temper_dev->int_in_endpoint->wMaxPacketSize),
+			 temper_int_in_callback,
+			 temper_dev,
+			 temper_dev->int_in_endpoint->bInterval);
+
+	/* Set up the control out URB */
+	temper_dev->ctrl_out_cr = kmalloc(sizeof(struct usb_ctrlrequest), GFP_KERNEL);
+	if (!temper_dev->ctrl_out_cr) {
+		printk(KERN_ERR "temper: could not allocate usb_ctrlrequest");
+		rc = -ENOMEM;
+		goto free_int_urb;
+	}
+
+	temper_dev->ctrl_out_cr->bRequestType = TEMPER_CTRL_REQUEST_TYPE;
+	temper_dev->ctrl_out_cr->bRequest = TEMPER_CTRL_REQUEST;
+	temper_dev->ctrl_out_cr->wValue = cpu_to_le16(TEMPER_CTRL_VALUE);
+	temper_dev->ctrl_out_cr->wIndex = cpu_to_le16(TEMPER_CTRL_INDEX);
+	temper_dev->ctrl_out_cr->wLength = cpu_to_le16(TEMPER_CTRL_BUFFER_SIZE);
+
+	temper_dev->ctrl_out_urb = usb_alloc_urb(0, GFP_KERNEL);
+	if (!temper_dev->ctrl_out_urb) {
+		printk(KERN_ERR "temper: could not allocate ctrl_out_urb");
+		rc = -ENOMEM;
+		goto free_out_cr;
+	}
+
+	usb_fill_control_urb(temper_dev->ctrl_out_urb,
+			     temper_dev->udev,
+			     usb_sndctrlpipe(temper_dev->udev, 0),
+			     (unsigned char *)temper_dev->ctrl_out_cr,
+			     temper_dev->ctrl_out_buffer,
+			     TEMPER_CTRL_BUFFER_SIZE,
+			     temper_ctrl_out_callback,
+			     temper_dev);	
+#endif
+
 	/* Data */
 	temper_dev->temp_in = 0;
 	temper_dev->temp_out = 0;
+	temper_dev->int_completed = false;
 	get_temp_value(temper_dev);
 
 	/* Save interface data */
@@ -181,6 +319,14 @@ static int temper_probe(struct usb_interface *interface,
 
 	return 0;
 
+#if USE_URB == 1
+free_out_cr:
+	kfree(temper_dev->ctrl_out_cr);
+free_int_urb:
+	kfree(temper_dev->int_in_urb);
+free_int_buf:
+	kfree(temper_dev->int_in_buffer);
+#endif
 free_out_buf:
 	kfree(temper_dev->ctrl_out_buffer);
 exit_err:
@@ -199,6 +345,11 @@ static void temper_disconnect(struct usb_interface *interface)
 	device_remove_file(&interface->dev, &dev_attr_temperatures);
 
 	/* Free interface data */
+#if USE_URB == 1
+	kfree(temper_dev->ctrl_out_cr);
+	kfree(temper_dev->int_in_urb);
+	kfree(temper_dev->int_in_buffer);
+#endif
 	kfree(temper_dev->ctrl_out_buffer);
 	usb_put_dev(temper_dev->udev);
 
