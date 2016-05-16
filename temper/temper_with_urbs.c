@@ -55,9 +55,7 @@ MODULE_DEVICE_TABLE(usb, temper_id_table);
 static int get_temp_value (struct usb_temper *temper_dev)
 {
 	int rc = 0;
-#if (USE_URB == 1)
-	int i;
-#else
+#if (USE_URB == 0)
 	int l;
 #endif
 
@@ -82,13 +80,13 @@ static int get_temp_value (struct usb_temper *temper_dev)
 
 	/* Dirty polling, just for the example */
 	rc = -EIO;
-	for (i = 0; i < 10; i++) {
+	for (;;) {
 		if (temper_dev->int_completed) {
 			temper_dev->int_completed = false;
 			rc = 0;
 			break;
 		}
-		msleep(20);
+		schedule();
 	}
 
 #else
